@@ -12,6 +12,7 @@
 #include "random"
 #include "fstream"
 #include "iomanip"
+#include "sstream"
 #include "limits"
 #include "cstdio"
 #include "cerrno"
@@ -38,6 +39,8 @@ const int bindFail=-3;
 const int sockNameFail=-4;
 const int ptonFail=-5;
 const int listenFail=-6;
+
+bool debugMode=false; //set once in main from argv before any threads start
 
 mutex listMut;
 mutex offerMut; //guards incomingOffers
@@ -179,28 +182,46 @@ void DisplayHeader()
 
 }
 
-void printPeer(const peer& p)
+string humanSize(uint64_t bytes) //5000000 -> 4.8 MB
+{
+    const char* units[]={"B","KB","MB","GB","TB"};
+    double size=bytes;
+    int u=0;
+    while(size>=1024 && u<4){size/=1024; u++;}
+    ostringstream out;
+    if(u==0) out<<bytes<<" B";
+    else out<<fixed<<setprecision(1)<<size<<" "<<units[u];
+    return out.str();
+}
+
+void printPeer(const peer& p,size_t idx)
 {
     char ip[INET_ADDRSTRLEN]="";
-    inet_ntop(AF_INET,&((const sockaddr_in*)&p.PeerAddr)->sin_addr,ip,sizeof(ip));
+    if(idx==0) strcpy(ip,"this machine"); //we never got our own broadcast so theres no address stored for us
+    else inet_ntop(AF_INET,&((const sockaddr_in*)&p.PeerAddr)->sin_addr,ip,sizeof(ip));
 
-    cout<<"\n";
-    cout<<"Name is "<<p.PeerName<<"\n"
-        <<"Ip is "<<ip<<"\n"
-        <<"Port is "<<ntohs(p.TcpPort)<<"\n";
-    cout<<"Id is ";
-    for(int i=0;i<idLen;i++) cout<<(int)p.PeerId[i];
+    string name=p.PeerName;
+    if(idx==0) name+=" (me)";
+
+    cout<<"  "<<left<<setw(4)<<idx<<setw(namelen+6)<<name<<setw(17)<<ip<<ntohs(p.TcpPort);
+    if(debugMode)
+    {
+        cout<<"   ";
+        for(int i=0;i<idLen;i++) cout<<hex<<setw(2)<<setfill('0')<<right<<(int)p.PeerId[i];
+        cout<<dec<<setfill(' ');
+    }
     cout<<"\n";
 }
 
 void PrintPeers(const vector<peer>& list)
 {
-    for(size_t i=0;i<list.size();i++)
-    {
-        cout<<"\nIndex "<<i<<(i==0 ? " (me)" : "");
-        printPeer(list[i]);
-    }
+    cout<<"\n  "<<left<<setw(4)<<"#"<<setw(namelen+6)<<"Name"<<setw(17)<<"IP"<<"Port";
+    if(debugMode) cout<<"    Id";
+    cout<<"\n  "<<string(debugMode ? 89 : 56,'-')<<"\n";
 
+    for(size_t i=0;i<list.size();i++) printPeer(list[i],i);
+
+    if(list.size()==1) cout<<"\n  No other peers found yet\n";
 }
 
 
@@ -453,7 +474,7 @@ bool FileTransfer(vector<peer>& list) //list[0] is guranteed to have my own self
     struct TCP_offer* myOffer=nullptr;
     string Path;
     if(!FormTCP_offer(myName,myOffer,Path)) return false;
-    printOffer(myOffer);
+    if(debugMode) printOffer(myOffer);
 
     int offerSock=connectToPeer(target);
     if(offerSock==-1){delete myOffer; return false;}
@@ -611,7 +632,9 @@ bool RespondToOffers()
     }
     //only the menu thread ever dequeues so the front cant change under us the accept thread only adds to the back
 
-    printOffer(&current.offer);
+    if(debugMode) printOffer(&current.offer);
+    cout<<"\n"<<current.offer.SenderName<<" wants to send you "<<(const char*)current.offer.fileName
+        <<" ("<<humanSize(be64toh(current.offer.fileSize))<<")\n";
 
     int answer=0;
     while(true){
@@ -638,7 +661,9 @@ bool RespondToOffers()
     if(!sendAll(current.sock,&myReply,sizeof(reply)) || answer!=1){close(current.sock); return false;}
 
     string saveName=makeSaveName(current.offer);
-    cout<<"Saving as "<<saveName<<"\n";
+    char cwd[4096];
+    if(getcwd(cwd,sizeof(cwd))) cout<<"Saving to "<<cwd<<"/"<<saveName<<"\n"; //files land wherever the program was started from
+    else cout<<"Saving as "<<saveName<<"\n";
     bool ok=recvFile(current.sock,saveName,be64toh(current.offer.fileSize));
     close(current.sock);
     if(ok) cout<<"File received\n";
@@ -664,6 +689,7 @@ int main(int args,char* argv[])
     int broadcastDelay=500;
     if(checkValidArgCount(args)) {cerr<<"Please enter a name for your computer\n"; return -1;}
     bool debug=setDebug(args,argv);
+    debugMode=debug;
     if(args>3) broadcastDelay=stoi(argv[3]);
 
     //========================================================
