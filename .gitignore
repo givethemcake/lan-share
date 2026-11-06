@@ -1,3 +1,7 @@
 # Claude Code local files
 .claude/
 CLAUDE.local.md
+
+# files from another project
+http_server.cpp
+helpers.h

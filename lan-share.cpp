@@ -11,8 +11,11 @@
 #include "mutex"
 #include "random"
 #include "fstream"
-#include "limits"
 #include "iomanip"
+#include "limits"
+#include "cstdio"
+#include "cerrno"
+#include "queue.h"
 
 using namespace std;
 
@@ -27,21 +30,25 @@ const int headerlen=6;
 const int namelen=25;
 const int idLen=16;
 const int FileNameLen=256;
+const size_t chunkSize=64*1024; //64KB per send/recv during the file transfer
 
 
 const int sockFail=-2;
 const int bindFail=-3;
 const int sockNameFail=-4;
 const int ptonFail=-5;
+const int listenFail=-6;
 
 mutex listMut;
+mutex offerMut; //guards incomingOffers
+mutex outMut;   //guards outgoingOffers
 
 #pragma pack(push,1)
 struct broadcast
 {
     char header[headerlen];
-    char MyName[namelen]; 
-    uint8_t myid[idLen]; //random 16 digit id 
+    char MyName[namelen];
+    uint8_t myid[idLen]; //random 16 digit id
     uint16_t myTcp; //network protocol
 };
 #pragma pack(pop)
@@ -62,9 +69,34 @@ struct reply
 };
 #pragma pack(pop)
 
+struct pendingOffer //an offer someone sent us that we havent said yes or no to yet
+{
+    int sock; //the accepted connection the sender is sitting on the other end waiting for our reply
+    TCP_offer offer;
+};
+
+Queue<pendingOffer> incomingOffers; //first come first served protected by offerMut
+
+struct outgoingOffer //an offer we sent that the other side hasnt answered yet
+{
+    int id;
+    int sock;
+    char peerName[namelen];
+    char fileName[FileNameLen];
+};
+
+vector<outgoingOffer> outgoingOffers; //vector not a queue cuz cancel can pull any one out protected by outMut
+int nextOfferId=1;                    //protected by outMut
+
 bool checkValidArgCount(int c)
 {
     return c<2;
+}
+
+void clearInput() //clear() only resets the flags ignore() throws away the junk still sitting in the buffer
+{
+    cin.clear();
+    cin.ignore(numeric_limits<streamsize>::max(),'\n');
 }
 
 void fillBroadCastStruct(broadcast& MyBroadCastMessage,char* name,unsigned short myPort)
@@ -78,7 +110,7 @@ void fillBroadCastStruct(broadcast& MyBroadCastMessage,char* name,unsigned short
     strcpy(MyBroadCastMessage.header,header);
     MyBroadCastMessage.myTcp=myPort;
     random_device rd;
-    for (int i = 0; i <idLen; i++) MyBroadCastMessage.myid[i] = rd() & 0xFF;//keep only the lowest 8 bits 
+    for (int i = 0; i <idLen; i++) MyBroadCastMessage.myid[i] = rd() & 0xFF;//keep only the lowest 8 bits
 
 }
 
@@ -87,7 +119,7 @@ void setUpAddrStorage(sockaddr_storage& Myaddr)
     memset(&Myaddr,0,sizeof(Myaddr));
     Myaddr.ss_family=AF_INET;
     struct sockaddr_in * MyIpv4Addr=(sockaddr_in * )&Myaddr;
-    MyIpv4Addr->sin_port=0; //host to network doesnt matter here cuz 0 is represented the same in both endains 
+    MyIpv4Addr->sin_port=0; //host to network doesnt matter here cuz 0 is represented the same in both endains
     MyIpv4Addr->sin_addr.s_addr=htonl(INADDR_ANY);
 }
 
@@ -102,11 +134,11 @@ void displayOwnInfo(broadcast toDisplay)
     cout<<"\n";
 }
 
-struct peer //need to add time stamps so i can remove dead peers 
+struct peer //need to add time stamps so i can remove dead peers
 {
     sockaddr_storage PeerAddr;
-    char PeerName[namelen]; 
-    uint8_t PeerId[idLen]; //random 16 digit id 
+    char PeerName[namelen];
+    uint8_t PeerId[idLen]; //random 16 digit id
     uint16_t TcpPort; //network protocol
 };
 
@@ -130,17 +162,31 @@ bool setDebug(int c, char* argv[])
 void DisplayHeader()
 {
 
-    cout<<"=================================================\n"
-        <<"         Welcome to lan-share\n"
-        <<"                             Made by Hammad Rehan\n";
-    cout<<"=================================================\n";
+    //raw string literal so the box drawing chars and spacing print exactly as written no escaping needed
+    cout<<R"(
+╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸
+╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸
+         ╻ ╻┏━╸╻  ┏━╸┏━┓┏┳┓┏━╸   ╺┳╸┏━┓   ╻  ┏━┓┏┓╻   ┏━┓╻ ╻┏━┓┏━┓┏━╸
+         ┃╻┃┣╸ ┃  ┃  ┃ ┃┃┃┃┣╸     ┃ ┃ ┃   ┃  ┣━┫┃┗┫╺━╸┗━┓┣━┫┣━┫┣┳┛┣╸
+         ┗┻┛┗━╸┗━╸┗━╸┗━┛╹ ╹┗━╸    ╹ ┗━┛   ┗━╸╹ ╹╹ ╹   ┗━┛╹ ╹╹ ╹╹┗╸┗━╸
+                  ┏┳┓┏━┓╺┳┓┏━╸   ┏┓ ╻ ╻   ╻ ╻┏━┓┏┳┓┏┳┓┏━┓╺┳┓   ┏━┓┏━╸╻ ╻┏━┓┏┓╻
+                  ┃┃┃┣━┫ ┃┃┣╸    ┣┻┓┗┳┛   ┣━┫┣━┫┃┃┃┃┃┃┣━┫ ┃┃   ┣┳┛┣╸ ┣━┫┣━┫┃┗┫
+                  ╹ ╹╹ ╹╺┻┛┗━╸   ┗━┛ ╹    ╹ ╹╹ ╹╹ ╹╹ ╹╹ ╹╺┻┛   ╹┗╸┗━╸╹ ╹╹ ╹╹ ╹
+
+╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸
+╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸╺━╸
+)";
 
 }
 
 void printPeer(const peer& p)
 {
+    char ip[INET_ADDRSTRLEN]="";
+    inet_ntop(AF_INET,&((const sockaddr_in*)&p.PeerAddr)->sin_addr,ip,sizeof(ip));
+
     cout<<"\n";
     cout<<"Name is "<<p.PeerName<<"\n"
+        <<"Ip is "<<ip<<"\n"
         <<"Port is "<<ntohs(p.TcpPort)<<"\n";
     cout<<"Id is ";
     for(int i=0;i<idLen;i++) cout<<(int)p.PeerId[i];
@@ -149,9 +195,12 @@ void printPeer(const peer& p)
 
 void PrintPeers(const vector<peer>& list)
 {
-    for(auto iterator=list.begin();iterator!=list.end();iterator++)
-        printPeer(*iterator);
-        
+    for(size_t i=0;i<list.size();i++)
+    {
+        cout<<"\nIndex "<<i<<(i==0 ? " (me)" : "");
+        printPeer(list[i]);
+    }
+
 }
 
 
@@ -174,11 +223,11 @@ bool Discover(int broadCastSocket,sockaddr_storage BroadcastAddr,broadcast broad
     memset(&MessageRecv,0,sizeof(broadcast));
     size_t n=recvfrom(broadCastSocket,&MessageRecv,sizeof(broadcast),0,(sockaddr*)senderIpv4,&size);
 
-    if (n != (ssize_t)sizeof(broadcast)) return false;              
+    if (n != (ssize_t)sizeof(broadcast)) return false;
     if (memcmp(MessageRecv.header, "LSH1", 4) != 0) return false;   // not our protocol
-    MessageRecv.MyName[namelen-1] = '\0';  
+    MessageRecv.MyName[namelen-1] = '\0';
 
-    //now compare peers 
+    //now compare peers
     lock_guard<mutex> listlock(listMut);
     for(auto iterator=list.begin();iterator!=list.end();iterator++)
     {
@@ -198,8 +247,8 @@ bool Discover(int broadCastSocket,sockaddr_storage BroadcastAddr,broadcast broad
     sizeName=min(sizeName,namelen-1);
 
     struct peer *p = new peer;
-    
- 
+
+
 
 
     memset(p,0,sizeof(peer));
@@ -209,22 +258,71 @@ bool Discover(int broadCastSocket,sockaddr_storage BroadcastAddr,broadcast broad
 
     p->TcpPort=MessageRecv.myTcp;
     list.push_back(*p);
-  
-    delete p; //the vector itself now owns its own version of peer so we need to delete the heap version to avoid leaking memory 
+
+    delete p; //the vector itself now owns its own version of peer so we need to delete the heap version to avoid leaking memory
 
     return true;
-    
+
 }
 
 
+//=======================================================
+//          TCP helpers
+//                        start
+//=======================================================
+bool sendAll(int sock,const void* buf,size_t len) //send() can send less than we asked for so keep going till its all out
+{
+    const char* p=(const char*)buf;
+    while(len>0)
+    {
+        ssize_t n=send(sock,p,len,MSG_NOSIGNAL); //MSG_NOSIGNAL so a dead peer doesnt kill us with SIGPIPE
+        if(n<=0){perror("send failed"); return false;}
+        p+=n;
+        len-=n;
+    }
+    return true;
+}
 
-// bool sendTCPrequest(cosnt peer& recipiant,const TCP_offer& offer)
-// {
-//     connect(); //use my own TCP socket 
-// }
-bool FormTCP_offer(char* myName,TCP_offer*& ret);
+bool recvAll(int sock,void* buf,size_t len,bool quiet=false) //same deal as sendAll recv() can hand us a partial struct
+{
+    char* p=(char*)buf;
+    while(len>0)
+    {
+        ssize_t n=recv(sock,p,len,0);
+        if(n==0){if(!quiet) cerr<<"peer closed the connection\n"; return false;}
+        if(n<0){if(!quiet) perror("recv failed"); return false;}
+        p+=n;
+        len-=n;
+    }
+    return true;
+}
+
+int connectToPeer(const peer& p)
+{
+    sockaddr_in addr;
+    memcpy(&addr,&p.PeerAddr,sizeof(addr)); //ip comes from where their broadcast came from
+    addr.sin_family=AF_INET;
+    addr.sin_port=p.TcpPort; //swap 9999 for their tcp port already in network order so no htons
+
+    int sock=socket(AF_INET,SOCK_STREAM,0);
+    if(sock==-1){perror("socket() call failed for offer socket"); return -1;}
+
+    if(connect(sock,(sockaddr*)&addr,sizeof(addr))==-1){perror("connect failed"); close(sock); return -1;}
+    return sock;
+}
+
+void printProgress(uint64_t done,uint64_t total)
+{
+    int percent= total==0 ? 100 : (int)(done*100/total);
+    cout<<"\r"<<percent<<"% ("<<done<<"/"<<total<<" bytes)"<<flush;
+}
+//=======================================================
+//          TCP helpers
+//                        end
+//=======================================================
 
 
+bool FormTCP_offer(char* myName,TCP_offer*& ret,string& Path);
 
 
 
@@ -242,83 +340,172 @@ void printOffer(const TCP_offer* offer)
     cout << "-------------------\n";
 }
 
-bool FileTransfer(vector<peer>& list) //list[0] is guranteed to have my own self in it 
+bool sendFile(int sock,const string& Path,uint64_t fileSize) //runs in a background thread so no progress bar it would scribble over the menu
 {
-    uint8_t Peerid[idLen];
-    cout<<"\nEnter the Index for the peer you wish to send the file to: ";
-    
-    int idx=-1;
-    do
+    ifstream File(Path,ios::binary);
+    if(!File.is_open()){perror("File failed to open for sending"); return false;}
+
+    vector<char> buf(chunkSize);
+    uint64_t sent=0;
+    while(sent<fileSize)
     {
-        cin.clear();
-        cin.ignore(numeric_limits<streamsize>::max(), '\n');
-
-        cin>>idx;
-        if(!cin.fail())
-        {
-            if(idx<=0|| idx>=list.size()) {cout<<"\nThe index doesn't not belong to a valid peer\n";idx=-1;}
-            
-        }
-        else if(cin.fail()){{cout<<"\nThe index doesn't not belong to a valid peer\n";idx=-1;}}
-        
-    } while (cin.fail() || idx==-1);
-    
-    
-    
-    
-    
-    unique_lock<mutex> listLock(listMut);
-
-    // bool found=true;
-    // auto iterator=list.begin();
-    // for(;iterator!=list.end();iterator++)
-    // {
-    //     found=true;
-    //     for(int j=0;j<idLen;j++){
-    //         if((*iterator).PeerId[j]!=Peerid[j]) {found=false; break;}
-    //     }
-
-    //     if(found) break; //iterator points to the current peer which matches our PeerId
-    // }
-
-    // if(!found){cerr<<"The Peer id doesn't not belong to a valid peer\n"; return false;}
-    
-    struct TCP_offer* myOffer=nullptr;
-    if(!FormTCP_offer(list[0].PeerName,myOffer)) return false;
-    
-    printOffer(myOffer);
-
-
-
-
+        size_t toRead=min((uint64_t)chunkSize,fileSize-sent);
+        File.read(buf.data(),toRead);
+        if((size_t)File.gcount()!=toRead){cerr<<"\nFile read failed\n"; return false;}
+        if(!sendAll(sock,buf.data(),toRead)) return false;
+        sent+=toRead;
+    }
     return true;
-    
 }
 
-bool FormTCP_offer(char* myName,TCP_offer*& ret)
+bool takeOutgoing(int id) //true if we took it off the list false if cancel already did
 {
-
-    if(myName==nullptr){cerr<<"Nullptr was passed to FormTCP_offer\n"; ret=nullptr; return false;}
-
-    string Path;
-    int retry=0;
-    do{
-        cin.clear();
-        cin.ignore(numeric_limits<streamsize>::max(), '\n');
-        cout<<"Enter the Path for the file you want to send: ";
-        cin>>Path;
-    }while(cin.fail());
-
-    fstream File(Path,ios::binary|ios::in);
-    if(!File.is_open()) 
+    lock_guard<mutex> outLock(outMut);
+    for(auto iterator=outgoingOffers.begin();iterator!=outgoingOffers.end();iterator++)
     {
-        perror("provided File failed to open\n");
-        do{
+        if((*iterator).id==id){outgoingOffers.erase(iterator); return true;}
+    }
+    return false;
+}
+
+//one of these runs per sent offer so the menu is free while the other side makes up their mind
+void waitForReply(int id,int sock,string Path,uint64_t fileSize,string peerName,string fileName)
+{
+    struct reply theirReply;
+    memset(&theirReply,0,sizeof(theirReply));
+    bool gotReply=recvAll(sock,&theirReply,sizeof(reply),true); //quiet a cancel shows up here as a failed recv
+
+    if(!takeOutgoing(id)) //cancel got to it first CancelOffer already told the user
+    {close(sock); return;}
+
+    if(!gotReply){cout<<"\n>> "<<peerName<<" went away before answering your offer for "<<fileName<<"\n"; close(sock); return;}
+    if(memcmp(theirReply.header,"Reply",5)!=0){cerr<<"\n>> Got a bad reply from "<<peerName<<"\n"; close(sock); return;}
+    if(theirReply.Reply!=1){cout<<"\n>> "<<peerName<<" declined "<<fileName<<"\n"; close(sock); return;}
+
+    cout<<"\n>> "<<peerName<<" accepted "<<fileName<<", sending...\n";
+    bool ok=sendFile(sock,Path,fileSize);
+    close(sock);
+    if(ok) cout<<"\n>> Finished sending "<<fileName<<" to "<<peerName<<"\n";
+    else cout<<"\n>> Sending "<<fileName<<" to "<<peerName<<" failed\n";
+}
+
+bool CancelOffer()
+{
+    vector<int> ids;
+    {
+        lock_guard<mutex> outLock(outMut);
+        if(outgoingOffers.empty()){cout<<"You have no offers waiting on an answer\n"; return false;}
+        for(size_t i=0;i<outgoingOffers.size();i++)
+        {
+            cout<<i+1<<": "<<outgoingOffers[i].fileName<<" to "<<outgoingOffers[i].peerName<<"\n";
+            ids.push_back(outgoingOffers[i].id); //remember ids the list can change while the user types
+        }
+    }
+
+    int pick=-1;
+    while(true)
+    {
+        cout<<"Enter the offer to cancel (0 to go back): ";
+        if(cin>>pick && pick>=0 && pick<=(int)ids.size()) break;
+        if(cin.eof()) return false;
+        cout<<"Not a valid offer\n";
+        clearInput();
+    }
+    if(pick==0) return false;
+
+    lock_guard<mutex> outLock(outMut);
+    for(auto iterator=outgoingOffers.begin();iterator!=outgoingOffers.end();iterator++)
+    {
+        if((*iterator).id!=ids[pick-1]) continue;
+        cout<<"Cancelled "<<(*iterator).fileName<<" to "<<(*iterator).peerName<<"\n";
+        shutdown((*iterator).sock,SHUT_RDWR); //wakes up waitForReply and the other side sees the connection close and the thread is the one that closes the socket
+        outgoingOffers.erase(iterator);
+        return true;
+    }
+    cout<<"Too late, they already answered\n";
+    return false;
+}
+
+bool FileTransfer(vector<peer>& list) //list[0] is guranteed to have my own self in it
+{
+    int idx=-1;
+    while(true)
+    {
+        cout<<"\nEnter the Index for the peer you wish to send the file to: ";
+        if(cin>>idx)
+        {
+            lock_guard<mutex> listlock(listMut);
+            if(idx>0 && idx<(int)list.size()) break;
+        }
+        else if(cin.eof()) return false;
+        cout<<"\nThe index doesn't belong to a valid peer\n";
+        clearInput();
+    }
+
+    peer target;
+    char myName[namelen];
+    {
+        lock_guard<mutex> listlock(listMut); //only hold the lock while copying so discover isnt frozen while we type
+        target=list[idx];
+        memcpy(myName,list[0].PeerName,namelen);
+    }
+
+    struct TCP_offer* myOffer=nullptr;
+    string Path;
+    if(!FormTCP_offer(myName,myOffer,Path)) return false;
+    printOffer(myOffer);
+
+    int offerSock=connectToPeer(target);
+    if(offerSock==-1){delete myOffer; return false;}
+
+    bool ok=sendAll(offerSock,myOffer,sizeof(TCP_offer));
+    uint64_t fileSize=be64toh(myOffer->fileSize);
+    string fileName((const char*)myOffer->fileName);
+    delete myOffer; //only need the size and name from here on
+    if(!ok){close(offerSock); return false;}
+
+    outgoingOffer out;
+    memset(&out,0,sizeof(out));
+    out.sock=offerSock;
+    memcpy(out.peerName,target.PeerName,namelen);
+    memcpy(out.fileName,fileName.c_str(),min(fileName.length(),(size_t)FileNameLen-1));
+    {
+        lock_guard<mutex> outLock(outMut);
+        out.id=nextOfferId++;
+        outgoingOffers.push_back(out);
+    }
+
+    thread(waitForReply,out.id,offerSock,Path,fileSize,string(target.PeerName),fileName).detach(); //dont block the menu waiting on them
+    cout<<"Offer sent to "<<target.PeerName<<", you'll get a message when they answer\n";
+    return true;
+
+}
+
+bool FormTCP_offer(char* myName,TCP_offer*& ret,string& Path)
+{
+    ret=nullptr;
+    if(myName==nullptr){cerr<<"Nullptr was passed to FormTCP_offer\n"; return false;}
+
+    fstream File;
+    while(true)
+    {
+        cout<<"Enter the Path for the file you want to send: ";
+        cin>>ws; //eat the newline left over from the last cin>>
+        if(!getline(cin,Path)){if(cin.eof()) return false; clearInput(); continue;} //getline so paths with spaces work
+
+        File.open(Path,ios::binary|ios::in);
+        if(File.is_open()) break;
+
+        perror("provided File failed to open");
+        int retry=0;
+        while(true){
             cout<<"Would you like to try to open the file again? \n Enter 1 for yes.\n Enter 2 for no.\n";
-            cin>>retry;
-        }while(cin.fail());
-        if(retry==1) return FormTCP_offer(myName,ret);
-        else {ret=nullptr; return false;}
+            if(cin>>retry && (retry==1||retry==2)) break;
+            if(cin.eof()) return false;
+            clearInput();
+        }
+        if(retry!=1) return false;
+        File.clear();
     }
 
     size_t pos = Path.find_last_of('/');
@@ -327,33 +514,150 @@ bool FormTCP_offer(char* myName,TCP_offer*& ret)
     File.seekg(0, ios::end);
     streamoff size = File.tellg();
     File.seekg(0, ios::beg);
+    if(size<0 || name.empty()){cerr<<"That isnt a regular file\n"; return false;} //directories end up here
 
     TCP_offer* myOffer = new TCP_offer;
-    memset(myOffer, 0, sizeof(*myOffer));                  
+    memset(myOffer, 0, sizeof(*myOffer));
 
-    size_t nameCopy = min(name.length(), (size_t)FileNameLen - 1);   
+    size_t nameCopy = min(name.length(), (size_t)FileNameLen - 1);
     size_t myNameCopy = min(strlen(myName), (size_t)namelen - 1);
 
     memcpy(myOffer->header, "Offer", 5);
     memcpy(myOffer->SenderName, myName, myNameCopy);
     memcpy(myOffer->fileName, name.c_str(), nameCopy);
     myOffer->fileSize = htobe64((uint64_t)size);
-   
+
 
     ret=myOffer;
     return true;
-    
+
 }
+
+
+//=======================================================
+//          Receiving side
+//                        start
+//=======================================================
+string makeSaveName(const TCP_offer& offer)
+{
+    string name((const char*)offer.fileName,strnlen((const char*)offer.fileName,FileNameLen));
+    size_t pos=name.find_last_of('/');
+    if(pos!=string::npos) name=name.substr(pos+1); //never trust a path from the sender only keep the file name
+    if(name.empty()||name=="."||name=="..") name="received_file";
+
+    string saveName=name;
+    int copy=1;
+    while(ifstream(saveName).good()) saveName=to_string(copy++)+"_"+name; //dont overwrite anything already here
+    return saveName;
+}
+
+bool recvFile(int sock,const string& saveName,uint64_t fileSize)
+{
+    ofstream File(saveName,ios::binary);
+    if(!File.is_open()){perror("couldnt create the file"); return false;}
+
+    vector<char> buf(chunkSize);
+    uint64_t got=0;
+    while(got<fileSize)
+    {
+        size_t want=min((uint64_t)chunkSize,fileSize-got);
+        ssize_t n=recv(sock,buf.data(),want,0);
+        if(n<=0)
+        {
+            if(n==0) cerr<<"\nSender closed the connection early\n";
+            else perror("\nrecv failed during transfer");
+            File.close();
+            remove(saveName.c_str()); //dont leave half a file lying around
+            return false;
+        }
+        File.write(buf.data(),n);
+        got+=n;
+        printProgress(got,fileSize);
+    }
+    cout<<"\n";
+    return true;
+}
+
+bool senderStillWaiting(int sock) //peek without blocking if the sender cancelled their side is closed and recv gives 0
+{
+    char c;
+    ssize_t n=recv(sock,&c,1,MSG_PEEK|MSG_DONTWAIT);
+    if(n<0 && (errno==EAGAIN||errno==EWOULDBLOCK)) return true; //nothing to read still sitting there waiting on us
+    return n>0;
+}
+
+int pruneCancelledOffers() //drops offers the sender cancelled returns how many are still waiting
+{
+    lock_guard<mutex> offerLock(offerMut);
+    int count=incomingOffers.size();
+    for(int i=0;i<count;i++) //cycle through once the live ones go back in the same order
+    {
+        pendingOffer current=incomingOffers.dequeue();
+        if(senderStillWaiting(current.sock)) {incomingOffers.enqueue(current); continue;}
+        cout<<"\n>> "<<current.offer.SenderName<<" cancelled their offer for "<<(const char*)current.offer.fileName<<"\n";
+        close(current.sock);
+    }
+    return incomingOffers.size();
+}
+
+bool RespondToOffers()
+{
+    if(pruneCancelledOffers()==0){cout<<"No pending offers\n"; return false;}
+
+    pendingOffer current;
+    {
+        lock_guard<mutex> offerLock(offerMut);
+        current=incomingOffers.peek(); //peek not dequeue if they pick later it stays at the front
+    }
+    //only the menu thread ever dequeues so the front cant change under us the accept thread only adds to the back
+
+    printOffer(&current.offer);
+
+    int answer=0;
+    while(true){
+        cout<<"Accept this file?\n Enter 1 for yes.\n Enter 2 for no.\n Enter 3 to decide later.\n";
+        if(cin>>answer && answer>=1 && answer<=3) break;
+        if(cin.eof()) return false;
+        clearInput();
+    }
+    if(answer==3) return false;
+
+    {
+        lock_guard<mutex> offerLock(offerMut);
+        incomingOffers.dequeue(); //decided take it off the front
+    }
+
+    if(!senderStillWaiting(current.sock)) //they cancelled while we were thinking
+    {cout<<current.offer.SenderName<<" cancelled this offer\n"; close(current.sock); return false;}
+
+    struct reply myReply;
+    memset(&myReply,0,sizeof(myReply));
+    memcpy(myReply.header,"Reply",5);
+    myReply.Reply= answer==1 ? 1 : 0;
+
+    if(!sendAll(current.sock,&myReply,sizeof(reply)) || answer!=1){close(current.sock); return false;}
+
+    string saveName=makeSaveName(current.offer);
+    cout<<"Saving as "<<saveName<<"\n";
+    bool ok=recvFile(current.sock,saveName,be64toh(current.offer.fileSize));
+    close(current.sock);
+    if(ok) cout<<"File received\n";
+    return ok;
+}
+//=======================================================
+//          Receiving side
+//                        end
+//=======================================================
 
 int main(int args,char* argv[])
 {
 
     //=====================================================================================
-    //      For Args 
+    //      For Args
     //          Argv[0] = program name
     //          Argv[1] = own Peer name
-    //          Argv[2] = Debug Mode default no options: yes
-    //          Argv[3] = broadCast delay in milliSeconds default: 500 ms or .5 of a second 
+    //          Argv[2] = Debug Mode default no options yes
+    //          Argv[3] = broadCast delay in milliSeconds default 500 ms or 5 of a second
     //======================================================================================
 
 
@@ -371,7 +675,7 @@ int main(int args,char* argv[])
 
     struct sockaddr_storage Myaddr;
     setUpAddrStorage(Myaddr);
-    
+
     int status=bind(sockfd,(sockaddr *)&Myaddr,sizeof(sockaddr_in));
     if(status==-1){perror("bind call failed\n"); return bindFail;}
 
@@ -382,13 +686,14 @@ int main(int args,char* argv[])
     if(status==-1){perror("getsockname call failed\n"); return sockNameFail;}
 
     struct sockaddr_in* boundAddrIn=(sockaddr_in *)&boundAddr;
-    listen(sockfd,16);
+    status=listen(sockfd,16);
+    if(status==-1){perror("listen call failed\n"); return listenFail;}
 
     //debug Print
     if(debug)
     cout<<ntohs(boundAddrIn->sin_port)<<"\n";
     //debug Print
-    
+
     //========================================================
     //      create and bind a socket to a random port
     //                        END
@@ -407,7 +712,7 @@ int main(int args,char* argv[])
     //   Build my own broadcast message with my name and id
     //                        end
     //=======================================================
-    
+
 
     //=======================================================
     //   Make a list of peers and add myself as peer 0
@@ -418,7 +723,7 @@ int main(int args,char* argv[])
     for(int i=0;i<idLen;i++) Me.PeerId[i]=MyBroadCastMessage.myid[i];
     for(int i=0;i<namelen;i++)Me.PeerName[i]=MyBroadCastMessage.MyName[i];
     Me.TcpPort=MyBroadCastMessage.myTcp;
-    
+
     vector<peer> list;
     list.push_back(Me);
     //=======================================================
@@ -429,12 +734,12 @@ int main(int args,char* argv[])
     DisplayHeader();
 
     //=======================================================
-    //           set up broadcast addr and socket  
+    //           set up broadcast addr and socket
     //                        end
     //=======================================================
-    int datagramSock=socket(AF_INET,SOCK_DGRAM,0); // new socket exclusively for broadCasts and discovers 
+    int datagramSock=socket(AF_INET,SOCK_DGRAM,0); // new socket exclusively for broadCasts and discovers
     if(datagramSock==-1){perror("Socket() failed for datagramSocket"); return sockFail;}
-    
+
     sockaddr_storage broadCastAddr;
     memset(&broadCastAddr,0,sizeof(broadCastAddr));
     sockaddr_in * broadCastAddr_in=(sockaddr_in *)&broadCastAddr;
@@ -447,24 +752,24 @@ int main(int args,char* argv[])
     int on = 1;
     setsockopt(datagramSock, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on));  // required to send to a broadcast address
     setsockopt(datagramSock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));  // allow several sockets on 9999
-    setsockopt(datagramSock, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));  
+    setsockopt(datagramSock, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
 
     timeval tv{1, 0};
     setsockopt(datagramSock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));   // recvfrom returns every 1s
     status=bind(datagramSock,(sockaddr*)broadCastAddr_in,sizeof(sockaddr_in));
     if(status==-1){perror("bind failed for datagram socket\n"); return bindFail;}
     //==============================================================
-    //           set up broadcast addr and socket  
+    //           set up broadcast addr and socket
     //                        end
     //==============================================================
 
 
-  
+
 
 
 
     //==============================================================
-    //          Set up BroadCast thread  
+    //          Set up BroadCast thread
     //                        start
     //==============================================================
     thread broadcastThread([&]()
@@ -475,13 +780,13 @@ int main(int args,char* argv[])
         }
     });
     //==============================================================
-    //           set up BoradCast thread 
+    //           set up BoradCast thread
     //                        end
     //==============================================================
 
 
     //==============================================================
-    //          Set up Discover thread  
+    //          Set up Discover thread
     //                        start
     //==============================================================
     thread discoverThread([&]()
@@ -494,63 +799,110 @@ int main(int args,char* argv[])
         }
     });
     //==============================================================
-    //           set up Discover thread 
+    //           set up Discover thread
     //                        end
     //==============================================================
 
-  
-    while (true)
+
+    //==============================================================
+    //          Set up Accept thread
+    //                        start
+    //==============================================================
+    thread acceptThread([&]()
     {
-       
-        bool found=false;
+        while(true){
+        int conn=accept(sockfd,nullptr,nullptr); //new socket for every incoming offer sockfd keeps listening
+        if(conn==-1){perror("accept failed"); continue;}
+
+        timeval connTimeout{10,0};
+        setsockopt(conn,SOL_SOCKET,SO_RCVTIMEO,&connTimeout,sizeof(connTimeout)); //if the sender stalls for 10s give up instead of hanging forever
+
+        pendingOffer incoming;
+        memset(&incoming,0,sizeof(incoming));
+        if(!recvAll(conn,&incoming.offer,sizeof(TCP_offer)) || memcmp(incoming.offer.header,"Offer",5)!=0)
+        {close(conn); continue;} //not an offer not our problem
+
+        incoming.offer.SenderName[namelen-1]='\0';
+        incoming.offer.fileName[FileNameLen-1]='\0';
+        incoming.sock=conn;
+
+        lock_guard<mutex> offerLock(offerMut);
+        incomingOffers.enqueue(incoming);
+        cout<<"\n\n>> New file offer from "<<incoming.offer.SenderName<<", pick 3 whenever you want to respond\n";
+        }
+    });
+    //==============================================================
+    //           set up Accept thread
+    //                        end
+    //==============================================================
+
+
+    bool running=true;
+    while (running)
+    {
+
         char choice='\0';;
-        cout<<"Make a selection\n"
+        int waitingForMe=pruneCancelledOffers();
+        int waitingOnThem=0;
+        {
+            lock_guard<mutex> outLock(outMut);
+            waitingOnThem=outgoingOffers.size();
+        }
+        cout<<"\nMake a selection\n"
             <<"1: list peers\n"
-            <<"2: Discover peers\n"
-            <<"3: Broadcast to peers\n"
-            <<"4: Initiate File Transfer\n";
+            <<"2: Send a file\n"
+            <<"3: Respond to file offers ("<<waitingForMe<<" waiting)\n"
+            <<"4: Cancel a sent offer ("<<waitingOnThem<<" pending)\n"
+            <<"5: Quit\n";
         cin>>choice;
-        
+
         if(cin.eof()) break;
         else
         if(cin.fail())
         {
             cerr<<"Invalid entry\n";
-            cin.clear();
-            cin.ignore(numeric_limits<streamsize>::max(), '\n');
-
+            clearInput();
             choice='\0';
             continue;
         }
-        
-       
+        cin.ignore(numeric_limits<streamsize>::max(),'\n'); //so typing 12 doesnt turn into 1 then 2
+
+
 
         switch (choice)
         {
         case '1':{
             lock_guard<mutex> listlock(listMut);
             PrintPeers(list);
-           
+
             break;
         }
         case '2':
-            found=Discover(datagramSock,broadCastAddr,MyBroadCastMessage,list);
-            if(found && debug){cout<<"\nFound a new Peer\n";}
-            break;
-        case '3':
-            Broadcast(datagramSock,broadCastAddr,MyBroadCastMessage); //need to rename this function have too many broadcasts rn 
-            break; 
-        case '4':
             FileTransfer(list);
             break;
+        case '3':
+            RespondToOffers();
+            break;
+        case '4':
+            CancelOffer();
+            break;
+        case '5':
+            running=false;
+            break;
         default:
+            cout<<"Invalid entry\n";
             break;
         }
-       
+
 
     }
 
-    broadcastThread.join();
-    discoverThread.join();
+    //the threads loop forever so detach them the process ending takes them down with it
+    broadcastThread.detach();
+    discoverThread.detach();
+    acceptThread.detach();
+    close(sockfd);
+    close(datagramSock);
+    return 0;
 
 }
